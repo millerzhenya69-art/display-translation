@@ -1,0 +1,19 @@
+# Flutter / Dart
+tablet_client/.dart_tool/
+tablet_client/.flutter-plugins
+tablet_client/.flutter-plugins-dependencies
+tablet_client/build/
+tablet_client/android/.gradle/
+tablet_client/android/local.properties
+tablet_client/android/app/build/
+tablet_client/.idea/
+tablet_client/*.iml
+
+# PC server build artifacts
+pc_server/build/
+pc_server/*.o
+pc_server/*.exe
+
+# OS
+Thumbs.db
+.DS_Store
