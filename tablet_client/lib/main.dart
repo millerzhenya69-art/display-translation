@@ -63,6 +63,17 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
       _socket = socket;
       setState(() => _status = 'Подключено');
 
+      // Сообщаем серверу физическое разрешение экрана устройства,
+      // чтобы он сам подобрал подходящий регион захвата.
+      final view = WidgetsBinding.instance.platformDispatcher.views.first;
+      final physicalSize = view.physicalSize;
+      final w = physicalSize.width.toInt();
+      final h = physicalSize.height.toInt();
+      final handshake = ByteData(8);
+      handshake.setUint32(0, w, Endian.little);
+      handshake.setUint32(4, h, Endian.little);
+      socket.add(handshake.buffer.asUint8List());
+
       socket.listen(
         _onData,
         onError: (_) => _onDisconnected(),
@@ -70,7 +81,7 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
         cancelOnError: true,
       );
     } catch (e) {
-      setState(() => _status = 'Нет соединения. Повтор через 3с...');
+      setState(() => _status = 'Нет соединения. Повтор через 3с...\n$e');
       _scheduleReconnect();
     } finally {
       _connecting = false;
@@ -140,6 +151,7 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
               )
             : Text(
                 _status,
+                textAlign: TextAlign.center,
                 style: const TextStyle(color: Colors.white54, fontSize: 16),
               ),
       ),

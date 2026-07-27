@@ -19,6 +19,9 @@ public:
     // Отправляет один кадр. Возвращает false, если клиент отключился (нужно снова WaitForClient).
     bool SendFrame(const std::vector<uint8_t>& jpeg);
 
+    // Читает ровно len байт с блокировкой (используется для рукопожатия с разрешением экрана клиента).
+    bool ReceiveExact(uint8_t* buffer, int len, int timeoutMs);
+
     bool HasClient() const { return clientSock_ != INVALID_SOCKET; }
 
     void CloseClient();

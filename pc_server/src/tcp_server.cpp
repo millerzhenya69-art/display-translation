@@ -67,6 +67,25 @@ bool TcpFrameServer::SendFrame(const std::vector<uint8_t>& jpeg) {
     return true;
 }
 
+bool TcpFrameServer::ReceiveExact(uint8_t* buffer, int len, int timeoutMs) {
+    if (clientSock_ == INVALID_SOCKET) return false;
+
+    timeval tv;
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    setsockopt(clientSock_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+    int received = 0;
+    while (received < len) {
+        int n = recv(clientSock_, (char*)buffer + received, len - received, 0);
+        if (n <= 0) {
+            return false;
+        }
+        received += n;
+    }
+    return true;
+}
+
 void TcpFrameServer::CloseClient() {
     if (clientSock_ != INVALID_SOCKET) {
         closesocket(clientSock_);
