@@ -2,6 +2,72 @@
 #include <dxgi1_2.h>
 #include <cstring>
 #include <algorithm>
+#include <iostream>
+
+// Важно: используем только адаптер 0 (основной GPU) - именно его использует
+// D3D11CreateDevice в ScreenCapture::Init по умолчанию, поэтому индексы должны совпадать.
+static IDXGIAdapter1* GetPrimaryAdapter(IDXGIFactory1* factory) {
+    IDXGIAdapter1* adapter = nullptr;
+    factory->EnumAdapters1(0, &adapter);
+    return adapter;
+}
+
+void ListAvailableOutputs() {
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) {
+        std::cerr << "Не удалось получить список мониторов\n";
+        return;
+    }
+
+    std::cout << "Доступные мониторы (индекс: имя, разрешение):\n";
+
+    IDXGIAdapter1* adapter = GetPrimaryAdapter(factory);
+    if (adapter) {
+        IDXGIOutput* output = nullptr;
+        for (UINT o = 0; adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; ++o) {
+            DXGI_OUTPUT_DESC desc;
+            if (SUCCEEDED(output->GetDesc(&desc))) {
+                int w = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
+                int h = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
+
+                // Конвертируем широкую строку в UTF-8, чтобы не смешивать cout/wcout на одном потоке (UB)
+                char nameUtf8[256] = {};
+                WideCharToMultiByte(CP_UTF8, 0, desc.DeviceName, -1, nameUtf8, sizeof(nameUtf8), nullptr, nullptr);
+
+                std::cout << "  [" << o << "] " << nameUtf8
+                          << " - " << w << "x" << h
+                          << (desc.AttachedToDesktop ? "" : " (отключен)") << "\n";
+            }
+            output->Release();
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    std::cout << "(индекс выше - это значение для monitor_index в config.txt)\n\n";
+}
+
+bool GetOutputResolution(int outputIndex, int& outW, int& outH) {
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) return false;
+
+    bool found = false;
+    IDXGIAdapter1* adapter = GetPrimaryAdapter(factory);
+    if (adapter) {
+        IDXGIOutput* output = nullptr;
+        if (adapter->EnumOutputs(outputIndex, &output) != DXGI_ERROR_NOT_FOUND) {
+            DXGI_OUTPUT_DESC desc;
+            if (SUCCEEDED(output->GetDesc(&desc))) {
+                outW = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
+                outH = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
+                found = true;
+            }
+            output->Release();
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return found;
+}
 
 ScreenCapture::~ScreenCapture() {
     Shutdown();

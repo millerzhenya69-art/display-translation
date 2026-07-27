@@ -17,6 +17,8 @@ static void WriteDefaults(const std::string& path, const Settings& s) {
     out << "jpeg_quality=" << s.jpeg_quality << "\n";
     out << "# TCP порт сервера (должен совпадать с adb reverse и клиентом)\n";
     out << "port=" << s.port << "\n";
+    out << "# Индекс монитора для захвата (смотрите список в консоли при запуске; 0 = основной)\n";
+    out << "monitor_index=" << s.monitor_index << "\n";
 }
 
 Settings Settings::LoadOrCreate(const std::string& path) {
@@ -53,6 +55,7 @@ Settings Settings::LoadOrCreate(const std::string& path) {
     s.fps = geti("fps", s.fps);
     s.jpeg_quality = geti("jpeg_quality", s.jpeg_quality);
     s.port = geti("port", s.port);
+    s.monitor_index = geti("monitor_index", s.monitor_index);
 
     return s;
 }

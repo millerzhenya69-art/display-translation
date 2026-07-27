@@ -6,6 +6,13 @@
 
 // Захват региона экрана через DXGI Desktop Duplication API.
 // Возвращает кадры в формате BGRA8 (плотная упаковка, без паддинга).
+// Выводит в консоль список доступных выходов (мониторов) с их именами и разрешением,
+// чтобы пользователь мог понять, под каким индексом находится виртуальный монитор.
+void ListAvailableOutputs();
+
+// Возвращает разрешение конкретного выхода (монитора) по индексу. false, если такого нет.
+bool GetOutputResolution(int outputIndex, int& outW, int& outH);
+
 class ScreenCapture {
 public:
     ~ScreenCapture();

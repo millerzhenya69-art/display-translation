@@ -15,11 +15,8 @@
 // Вычисляет оптимальный регион захвата под разрешение экрана клиента:
 // подбирает максимальный прямоугольник с пропорциями клиента, вписанный
 // в реальный рабочий стол, начиная от левого верхнего угла.
-static void ComputeAutoRegion(int clientW, int clientH,
+static void ComputeAutoRegion(int clientW, int clientH, int desktopW, int desktopH,
                               int& outX, int& outY, int& outW, int& outH) {
-    int desktopW = GetSystemMetrics(SM_CXSCREEN);
-    int desktopH = GetSystemMetrics(SM_CYSCREEN);
-
     if (clientW <= 0 || clientH <= 0 || desktopW <= 0 || desktopH <= 0) {
         outX = 0; outY = 0; outW = 800; outH = 1280;
         return;
@@ -45,13 +42,16 @@ int main() {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
-    std::cout << "=== Display Translation - PC Server ===\n";
+    std::cout << "=== Display Translation - PC Server ===\n\n";
+
+    ListAvailableOutputs();
 
     Settings settings = Settings::LoadOrCreate("config.txt");
     std::cout << "Регион захвата по умолчанию: " << settings.region_w << "x" << settings.region_h
               << " (будет автоматически подстроен под экран планшета при подключении)\n";
     std::cout << "FPS: " << settings.fps << ", JPEG quality: " << settings.jpeg_quality
-              << ", порт: " << settings.port << "\n";
+              << ", порт: " << settings.port << ", monitor_index: " << settings.monitor_index << "\n";
+    std::cout.flush();
 
     if (!InitJpegEncoder()) {
         std::cerr << "Не удалось инициализировать JPEG-кодировщик (WIC)\n";
@@ -59,7 +59,7 @@ int main() {
     }
 
     ScreenCapture capture;
-    if (!capture.Init(0)) {
+    if (!capture.Init(settings.monitor_index)) {
         std::cerr << "Не удалось инициализировать захват экрана (DXGI Desktop Duplication)\n";
         ShutdownJpegEncoder();
         return 1;
@@ -97,7 +97,9 @@ int main() {
         if (server.ReceiveExact(handshake, 8, 3000)) {
             uint32_t clientW = handshake[0] | (handshake[1] << 8) | (handshake[2] << 16) | (uint32_t(handshake[3]) << 24);
             uint32_t clientH = handshake[4] | (handshake[5] << 8) | (handshake[6] << 16) | (uint32_t(handshake[7]) << 24);
-            ComputeAutoRegion(static_cast<int>(clientW), static_cast<int>(clientH),
+            int monW = 0, monH = 0;
+            GetOutputResolution(settings.monitor_index, monW, monH);
+            ComputeAutoRegion(static_cast<int>(clientW), static_cast<int>(clientH), monW, monH,
                               regionX, regionY, regionW, regionH);
             std::cout << "Экран планшета: " << clientW << "x" << clientH
                       << " -> регион захвата: " << regionW << "x" << regionH << "\n";
@@ -118,7 +120,7 @@ int main() {
             if (hadError) {
                 std::cerr << "Ошибка захвата экрана, переинициализация...\n";
                 capture.Shutdown();
-                if (!capture.Init(0)) {
+                if (!capture.Init(settings.monitor_index)) {
                     std::cerr << "Не удалось восстановить захват экрана\n";
                     server.Stop();
                     ShutdownJpegEncoder();
