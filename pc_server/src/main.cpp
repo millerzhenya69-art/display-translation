@@ -109,13 +109,22 @@ int main() {
 
         std::cout << "Начинаю трансляцию.\n";
 
+        // Статистика по этапам для диагностики узких мест по производительности
+        long long sumCaptureMs = 0, sumEncodeMs = 0, sumSendMs = 0;
+        int statFrames = 0;
+        auto lastStatsPrint = std::chrono::steady_clock::now();
+
         while (server.HasClient()) {
             auto frameStart = std::chrono::steady_clock::now();
+
+            auto tCaptureStart = std::chrono::steady_clock::now();
 
             bool hadError = false;
             bool gotFrame = capture.CaptureRegion(
                 regionX, regionY, regionW, regionH,
                 bgraBuffer, frameIntervalMs, hadError);
+
+            auto tCaptureEnd = std::chrono::steady_clock::now();
 
             if (hadError) {
                 std::cerr << "Ошибка захвата экрана, переинициализация...\n";
@@ -130,11 +139,34 @@ int main() {
             }
 
             if (gotFrame) {
-                if (EncodeBgraToJpeg(bgraBuffer.data(), regionW, regionH,
-                                     settings.jpeg_quality, jpegBuffer)) {
-                    if (!server.SendFrame(jpegBuffer)) {
+                auto tEncodeStart = std::chrono::steady_clock::now();
+                bool encoded = EncodeBgraToJpeg(bgraBuffer.data(), regionW, regionH,
+                                     settings.jpeg_quality, jpegBuffer);
+                auto tEncodeEnd = std::chrono::steady_clock::now();
+
+                if (encoded) {
+                    bool sent = server.SendFrame(jpegBuffer);
+                    auto tSendEnd = std::chrono::steady_clock::now();
+
+                    if (!sent) {
                         std::cout << "Планшет отключился.\n";
                         break;
+                    }
+
+                    sumCaptureMs += std::chrono::duration_cast<std::chrono::milliseconds>(tCaptureEnd - tCaptureStart).count();
+                    sumEncodeMs += std::chrono::duration_cast<std::chrono::milliseconds>(tEncodeEnd - tEncodeStart).count();
+                    sumSendMs += std::chrono::duration_cast<std::chrono::milliseconds>(tSendEnd - tEncodeEnd).count();
+                    statFrames++;
+
+                    auto now = std::chrono::steady_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::seconds>(now - lastStatsPrint).count() >= 3 && statFrames > 0) {
+                        std::cout << "[диагностика] за " << statFrames << " кадров: захват=" << (sumCaptureMs / statFrames)
+                                  << "мс, кодирование=" << (sumEncodeMs / statFrames)
+                                  << "мс, отправка=" << (sumSendMs / statFrames)
+                                  << "мс, факт. FPS=" << (1000.0 / std::max(1LL, (sumCaptureMs + sumEncodeMs + sumSendMs) / statFrames)) << "\n";
+                        sumCaptureMs = sumEncodeMs = sumSendMs = 0;
+                        statFrames = 0;
+                        lastStatsPrint = now;
                     }
                 }
             }
