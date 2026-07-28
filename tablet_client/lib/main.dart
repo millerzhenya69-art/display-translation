@@ -106,6 +106,11 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
   void _onData(Uint8List chunk) {
     _buffer.add(chunk);
 
+    // Собираем ВСЕ целые кадры, накопившиеся в буфере, но показываем только самый последний.
+    // Это критично важно на слабых устройствах - иначе отставание будет только расти,
+    // так как устройство не успевает отрисовывать все накопившиеся кадры.
+    Uint8List? latestFrame;
+
     while (true) {
       final bytes = _buffer.toBytes();
 
@@ -127,7 +132,11 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
       _buffer.add(rest);
       _expectedFrameLen = null;
 
-      _lastFrame = frame;
+      latestFrame = frame;
+    }
+
+    if (latestFrame != null) {
+      _lastFrame = latestFrame;
       if (mounted) setState(() {});
     }
   }
