@@ -102,6 +102,21 @@ int main() {
         }
 
         H264Encoder encoder;
+        // NV12 требует чётных размеров - округляем ЗАРАНЕЕ, чтобы сообщить клиенту точные итоговые размеры.
+        regionW &= ~1;
+        regionH &= ~1;
+
+        // Сообщаем клиенту итоговый размер кадра (нужен для настройки MediaCodec на Android)
+        uint8_t sizeResp[8];
+        uint32_t rw = static_cast<uint32_t>(regionW), rh = static_cast<uint32_t>(regionH);
+        sizeResp[0] = rw & 0xFF; sizeResp[1] = (rw >> 8) & 0xFF; sizeResp[2] = (rw >> 16) & 0xFF; sizeResp[3] = (rw >> 24) & 0xFF;
+        sizeResp[4] = rh & 0xFF; sizeResp[5] = (rh >> 8) & 0xFF; sizeResp[6] = (rh >> 16) & 0xFF; sizeResp[7] = (rh >> 24) & 0xFF;
+        if (!server.SendRaw(sizeResp, 8)) {
+            std::cerr << "Не удалось отправить размер кадра клиенту\n";
+            server.CloseClient();
+            continue;
+        }
+
         if (!encoder.Init(regionW, regionH, settings.fps, settings.bitrate_kbps * 1000)) {
             std::cerr << "Не удалось инициализировать H.264-кодировщик\n";
             server.CloseClient();

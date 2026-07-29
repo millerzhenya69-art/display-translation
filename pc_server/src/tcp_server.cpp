@@ -36,10 +36,24 @@ bool TcpFrameServer::WaitForClient() {
     return clientSock_ != INVALID_SOCKET;
 }
 
-bool TcpFrameServer::SendFrame(const std::vector<uint8_t>& jpeg) {
+bool TcpFrameServer::SendRaw(const uint8_t* data, int len) {
+    if (clientSock_ == INVALID_SOCKET) return false;
+    int sentTotal = 0;
+    while (sentTotal < len) {
+        int sent = send(clientSock_, (const char*)data + sentTotal, len - sentTotal, 0);
+        if (sent == SOCKET_ERROR) {
+            CloseClient();
+            return false;
+        }
+        sentTotal += sent;
+    }
+    return true;
+}
+
+bool TcpFrameServer::SendFrame(const std::vector<uint8_t>& data) {
     if (clientSock_ == INVALID_SOCKET) return false;
 
-    uint32_t len = static_cast<uint32_t>(jpeg.size());
+    uint32_t len = static_cast<uint32_t>(data.size());
     uint8_t header[4] = {
         static_cast<uint8_t>(len & 0xFF),
         static_cast<uint8_t>((len >> 8) & 0xFF),
@@ -47,22 +61,8 @@ bool TcpFrameServer::SendFrame(const std::vector<uint8_t>& jpeg) {
         static_cast<uint8_t>((len >> 24) & 0xFF),
     };
 
-    if (send(clientSock_, (const char*)header, 4, 0) != 4) {
-        CloseClient();
-        return false;
-    }
-
-    size_t sentTotal = 0;
-    const char* data = reinterpret_cast<const char*>(jpeg.data());
-    while (sentTotal < jpeg.size()) {
-        int sent = send(clientSock_, data + sentTotal,
-                        static_cast<int>(jpeg.size() - sentTotal), 0);
-        if (sent == SOCKET_ERROR) {
-            CloseClient();
-            return false;
-        }
-        sentTotal += sent;
-    }
+    if (!SendRaw(header, 4)) return false;
+    if (!data.empty() && !SendRaw(data.data(), static_cast<int>(data.size()))) return false;
 
     return true;
 }

@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 const int kPort = 27183;
+const MethodChannel _videoChannel = MethodChannel('display_translation/video');
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -38,7 +39,7 @@ class ScreenMirrorPage extends StatefulWidget {
 
 class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
   Socket? _socket;
-  Uint8List? _lastFrame;
+  int? _textureId;
   String _status = 'Подключение...';
   bool _connecting = false;
 
@@ -61,10 +62,8 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
       final socket = await Socket.connect('127.0.0.1', kPort,
           timeout: const Duration(seconds: 5));
       _socket = socket;
-      setState(() => _status = 'Подключено');
 
-      // Сообщаем серверу физическое разрешение экрана устройства,
-      // чтобы он сам подобрал подходящий регион захвата.
+      // Сообщаем серверу физическое разрешение экрана устройства
       final view = WidgetsBinding.instance.platformDispatcher.views.first;
       final physicalSize = view.physicalSize;
       final w = physicalSize.width.toInt();
@@ -73,6 +72,20 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
       handshake.setUint32(0, w, Endian.little);
       handshake.setUint32(4, h, Endian.little);
       socket.add(handshake.buffer.asUint8List());
+
+      // Ждём ответ сервера с итоговым размером кадра, который он будет кодировать
+      final sizeBytes = await _readExact(socket, 8);
+      final bd = ByteData.sublistView(sizeBytes);
+      final frameW = bd.getUint32(0, Endian.little);
+      final frameH = bd.getUint32(4, Endian.little);
+
+      final textureId = await _videoChannel.invokeMethod<int>('start', {
+        'width': frameW,
+        'height': frameH,
+      });
+      _textureId = textureId;
+
+      setState(() => _status = 'Подключено');
 
       socket.listen(
         _onData,
@@ -88,6 +101,26 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
     }
   }
 
+  // Читает ровно [len] байт из сокета, дожидаясь их поступления.
+  Future<Uint8List> _readExact(Socket socket, int len) async {
+    final completer = Completer<Uint8List>();
+    final collected = BytesBuilder(copy: false);
+    late StreamSubscription sub;
+    sub = socket.listen((chunk) {
+      collected.add(chunk);
+      if (collected.length >= len) {
+        sub.cancel();
+        final bytes = collected.toBytes();
+        completer.complete(bytes.sublist(0, len));
+        // Остаток (если есть) обрабатываем через основной _onData вручную
+        if (bytes.length > len) {
+          _onData(bytes.sublist(len));
+        }
+      }
+    }, onError: (e) => completer.completeError(e));
+    return completer.future.timeout(const Duration(seconds: 5));
+  }
+
   void _scheduleReconnect() {
     Future.delayed(const Duration(seconds: 3), () {
       if (mounted && _socket == null) _connect();
@@ -98,6 +131,8 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
     _socket = null;
     _buffer.clear();
     _expectedFrameLen = null;
+    _videoChannel.invokeMethod('stop');
+    _textureId = null;
     if (!mounted) return;
     setState(() => _status = 'Соединение разорвано. Переподключение...');
     _scheduleReconnect();
@@ -105,11 +140,6 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
 
   void _onData(Uint8List chunk) {
     _buffer.add(chunk);
-
-    // Собираем ВСЕ целые кадры, накопившиеся в буфере, но показываем только самый последний.
-    // Это критично важно на слабых устройствах - иначе отставание будет только расти,
-    // так как устройство не успевает отрисовывать все накопившиеся кадры.
-    Uint8List? latestFrame;
 
     while (true) {
       final bytes = _buffer.toBytes();
@@ -132,18 +162,17 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
       _buffer.add(rest);
       _expectedFrameLen = null;
 
-      latestFrame = frame;
-    }
-
-    if (latestFrame != null) {
-      _lastFrame = latestFrame;
-      if (mounted) setState(() {});
+      // В отличие от JPEG-версии, тут НЕ пропускаем кадры - H.264 кадры
+      // зависят друг от друга (P-фреймы), пропуск сломает декодирование.
+      // MediaCodec на нативной стороне сам справляется с очередью быстро.
+      _videoChannel.invokeMethod('feedData', {'data': frame});
     }
   }
 
   @override
   void dispose() {
     _socket?.destroy();
+    _videoChannel.invokeMethod('stop');
     super.dispose();
   }
 
@@ -152,12 +181,8 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
     return Scaffold(
       backgroundColor: Colors.black,
       body: Center(
-        child: _lastFrame != null
-            ? Image.memory(
-                _lastFrame!,
-                gaplessPlayback: true,
-                fit: BoxFit.contain,
-              )
+        child: _textureId != null
+            ? Texture(textureId: _textureId!)
             : Text(
                 _status,
                 textAlign: TextAlign.center,
