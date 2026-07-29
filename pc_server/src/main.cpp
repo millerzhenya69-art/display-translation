@@ -1,10 +1,10 @@
 // Display Translation - PC Server
-// Захватывает заданный регион экрана, кодирует в JPEG и стримит на планшет
+// Захватывает заданный регион экрана, кодирует в H.264 и стримит на планшет
 // через TCP (планшет подключается через "adb reverse" по USB).
 
 #include "tcp_server.h"   // winsock2.h должен быть включён раньше windows.h
 #include "capture.h"
-#include "jpeg_encoder.h"
+#include "h264_encoder.h"
 #include "config.h"
 
 #include <chrono>
@@ -42,26 +42,20 @@ int main() {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
-    std::cout << "=== Display Translation - PC Server ===\n\n";
+    std::cout << "=== Display Translation - PC Server (H.264) ===\n\n";
 
     ListAvailableOutputs();
 
     Settings settings = Settings::LoadOrCreate("config.txt");
     std::cout << "Регион захвата по умолчанию: " << settings.region_w << "x" << settings.region_h
               << " (будет автоматически подстроен под экран планшета при подключении)\n";
-    std::cout << "FPS: " << settings.fps << ", JPEG quality: " << settings.jpeg_quality
-              << ", порт: " << settings.port << ", monitor_index: " << settings.monitor_index << "\n";
+    std::cout << "FPS: " << settings.fps << ", битрейт: " << settings.bitrate_kbps
+              << " кбит/с, порт: " << settings.port << ", monitor_index: " << settings.monitor_index << "\n";
     std::cout.flush();
-
-    if (!InitJpegEncoder()) {
-        std::cerr << "Не удалось инициализировать JPEG-кодировщик (WIC)\n";
-        return 1;
-    }
 
     ScreenCapture capture;
     if (!capture.Init(settings.monitor_index)) {
         std::cerr << "Не удалось инициализировать захват экрана (DXGI Desktop Duplication)\n";
-        ShutdownJpegEncoder();
         return 1;
     }
 
@@ -69,7 +63,6 @@ int main() {
     if (!server.Start(settings.port)) {
         std::cerr << "Не удалось запустить TCP-сервер на порту " << settings.port << "\n";
         capture.Shutdown();
-        ShutdownJpegEncoder();
         return 1;
     }
 
@@ -79,7 +72,8 @@ int main() {
 
     const int frameIntervalMs = 1000 / std::max(1, settings.fps);
     std::vector<uint8_t> bgraBuffer;
-    std::vector<uint8_t> jpegBuffer;
+    std::vector<uint8_t> lastGoodFrame;
+    std::vector<uint8_t> nalBuffer;
 
     while (true) {
         std::cout << "Ожидание подключения планшета...\n";
@@ -107,7 +101,15 @@ int main() {
             std::cout << "Не получил разрешение экрана от клиента, использую регион из config.txt\n";
         }
 
+        H264Encoder encoder;
+        if (!encoder.Init(regionW, regionH, settings.fps, settings.bitrate_kbps * 1000)) {
+            std::cerr << "Не удалось инициализировать H.264-кодировщик\n";
+            server.CloseClient();
+            continue;
+        }
+
         std::cout << "Начинаю трансляцию.\n";
+        lastGoodFrame.clear();
 
         // Статистика по этапам для диагностики узких мест по производительности
         long long sumCaptureMs = 0, sumEncodeMs = 0, sumSendMs = 0;
@@ -116,8 +118,7 @@ int main() {
 
         while (server.HasClient()) {
             auto frameStart = std::chrono::steady_clock::now();
-
-            auto tCaptureStart = std::chrono::steady_clock::now();
+            auto tCaptureStart = frameStart;
 
             bool hadError = false;
             bool gotFrame = capture.CaptureRegion(
@@ -132,20 +133,25 @@ int main() {
                 if (!capture.Init(settings.monitor_index)) {
                     std::cerr << "Не удалось восстановить захват экрана\n";
                     server.Stop();
-                    ShutdownJpegEncoder();
                     return 1;
                 }
                 continue;
             }
 
             if (gotFrame) {
+                lastGoodFrame = bgraBuffer;
+            }
+
+            // H.264-энкодеру нужен непрерывный поток кадров (даже повторяющихся),
+            // иначе он не начнёт выдавать данные - в отличие от JPEG, где кодировали
+            // только реально изменившиеся кадры.
+            if (!lastGoodFrame.empty()) {
                 auto tEncodeStart = std::chrono::steady_clock::now();
-                bool encoded = EncodeBgraToJpeg(bgraBuffer.data(), regionW, regionH,
-                                     settings.jpeg_quality, jpegBuffer);
+                bool encoded = encoder.EncodeFrame(lastGoodFrame.data(), nalBuffer);
                 auto tEncodeEnd = std::chrono::steady_clock::now();
 
                 if (encoded) {
-                    bool sent = server.SendFrame(jpegBuffer);
+                    bool sent = server.SendFrame(nalBuffer);
                     auto tSendEnd = std::chrono::steady_clock::now();
 
                     if (!sent) {
@@ -179,9 +185,10 @@ int main() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
             }
         }
+
+        encoder.Shutdown();
     }
 
     capture.Shutdown();
-    ShutdownJpegEncoder();
     return 0;
 }

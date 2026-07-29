@@ -12,7 +12,7 @@ add_executable(dt_server
     src/main.cpp
     src/config.cpp
     src/capture.cpp
-    src/jpeg_encoder.cpp
+    src/h264_encoder.cpp
     src/tcp_server.cpp
 )
 
@@ -26,6 +26,9 @@ target_link_libraries(dt_server PRIVATE
     ole32
     shlwapi
     oleaut32
+    mfplat
+    mfuuid
+    strmiids
 )
 
 # Static-link the mingw runtime so the exe doesn't need libstdc++/libgcc DLLs alongside it
