@@ -30,6 +30,8 @@ class DisplayTranslationApp extends StatelessWidget {
   }
 }
 
+enum _ConnState { awaitingSize, streaming }
+
 class ScreenMirrorPage extends StatefulWidget {
   const ScreenMirrorPage({super.key});
 
@@ -42,8 +44,9 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
   int? _textureId;
   String _status = 'Подключение...';
   bool _connecting = false;
+  _ConnState _connState = _ConnState.awaitingSize;
 
-  // Буфер для сборки кадров из TCP-потока (данные могут прийти по частям).
+  // Буфер для сборки данных из TCP-потока (данные могут прийти по частям).
   final BytesBuilder _buffer = BytesBuilder(copy: false);
   int? _expectedFrameLen;
 
@@ -62,6 +65,9 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
       final socket = await Socket.connect('127.0.0.1', kPort,
           timeout: const Duration(seconds: 5));
       _socket = socket;
+      _connState = _ConnState.awaitingSize;
+      _buffer.clear();
+      _expectedFrameLen = null;
 
       // Сообщаем серверу физическое разрешение экрана устройства
       final view = WidgetsBinding.instance.platformDispatcher.views.first;
@@ -73,52 +79,23 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
       handshake.setUint32(4, h, Endian.little);
       socket.add(handshake.buffer.asUint8List());
 
-      // Ждём ответ сервера с итоговым размером кадра, который он будет кодировать
-      final sizeBytes = await _readExact(socket, 8);
-      final bd = ByteData.sublistView(sizeBytes);
-      final frameW = bd.getUint32(0, Endian.little);
-      final frameH = bd.getUint32(4, Endian.little);
+      setState(() => _status = 'Подключено, ждём параметры видео...');
 
-      final textureId = await _videoChannel.invokeMethod<int>('start', {
-        'width': frameW,
-        'height': frameH,
-      });
-      _textureId = textureId;
-
-      setState(() => _status = 'Подключено');
-
+      // Один-единственный listen на весь срок жизни сокета (Socket - single-subscription
+      // stream, повторный listen() кидает исключение - именно это ломало соединение раньше).
       socket.listen(
         _onData,
-        onError: (_) => _onDisconnected(),
-        onDone: _onDisconnected,
+        onError: (e) => _onDisconnected('Ошибка сокета: $e'),
+        onDone: () => _onDisconnected('Соединение закрыто сервером'),
         cancelOnError: true,
       );
     } catch (e) {
       setState(() => _status = 'Нет соединения. Повтор через 3с...\n$e');
+      _socket = null;
       _scheduleReconnect();
     } finally {
       _connecting = false;
     }
-  }
-
-  // Читает ровно [len] байт из сокета, дожидаясь их поступления.
-  Future<Uint8List> _readExact(Socket socket, int len) async {
-    final completer = Completer<Uint8List>();
-    final collected = BytesBuilder(copy: false);
-    late StreamSubscription sub;
-    sub = socket.listen((chunk) {
-      collected.add(chunk);
-      if (collected.length >= len) {
-        sub.cancel();
-        final bytes = collected.toBytes();
-        completer.complete(bytes.sublist(0, len));
-        // Остаток (если есть) обрабатываем через основной _onData вручную
-        if (bytes.length > len) {
-          _onData(bytes.sublist(len));
-        }
-      }
-    }, onError: (e) => completer.completeError(e));
-    return completer.future.timeout(const Duration(seconds: 5));
   }
 
   void _scheduleReconnect() {
@@ -127,19 +104,51 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
     });
   }
 
-  void _onDisconnected() {
+  void _onDisconnected(String reason) {
+    _socket?.destroy();
     _socket = null;
     _buffer.clear();
     _expectedFrameLen = null;
     _videoChannel.invokeMethod('stop');
-    _textureId = null;
     if (!mounted) return;
-    setState(() => _status = 'Соединение разорвано. Переподключение...');
+    setState(() {
+      _textureId = null;
+      _status = '$reason\nПереподключение через 3с...';
+    });
     _scheduleReconnect();
   }
 
   void _onData(Uint8List chunk) {
     _buffer.add(chunk);
+
+    if (_connState == _ConnState.awaitingSize) {
+      final bytes = _buffer.toBytes();
+      if (bytes.length < 8) return; // ждём остальные байты рукопожатия
+
+      final bd = ByteData.sublistView(bytes, 0, 8);
+      final frameW = bd.getUint32(0, Endian.little);
+      final frameH = bd.getUint32(4, Endian.little);
+
+      _buffer.clear();
+      _buffer.add(bytes.sublist(8));
+      _connState = _ConnState.streaming;
+
+      _videoChannel.invokeMethod<int>('start', {
+        'width': frameW,
+        'height': frameH,
+      }).then((textureId) {
+        if (mounted) {
+          setState(() {
+            _textureId = textureId;
+            _status = 'Подключено';
+          });
+        }
+      }).catchError((e) {
+        if (mounted) setState(() => _status = 'Ошибка запуска декодера: $e');
+      });
+    }
+
+    if (_connState != _ConnState.streaming) return;
 
     while (true) {
       final bytes = _buffer.toBytes();
@@ -162,9 +171,8 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
       _buffer.add(rest);
       _expectedFrameLen = null;
 
-      // В отличие от JPEG-версии, тут НЕ пропускаем кадры - H.264 кадры
-      // зависят друг от друга (P-фреймы), пропуск сломает декодирование.
-      // MediaCodec на нативной стороне сам справляется с очередью быстро.
+      // H.264 кадры зависят друг от друга (P-фреймы) - в отличие от JPEG-версии,
+      // тут НЕЛЬЗЯ пропускать кадры, все передаются нативному декодеру по порядку.
       _videoChannel.invokeMethod('feedData', {'data': frame});
     }
   }
@@ -180,14 +188,22 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Center(
-        child: _textureId != null
-            ? Texture(textureId: _textureId!)
-            : Text(
-                _status,
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white54, fontSize: 16),
+      body: Stack(
+        children: [
+          if (_textureId != null)
+            Positioned.fill(child: Texture(textureId: _textureId!)),
+          if (_textureId == null)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text(
+                  _status,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white, fontSize: 20),
+                ),
               ),
+            ),
+        ],
       ),
     );
   }
