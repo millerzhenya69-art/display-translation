@@ -8,6 +8,29 @@
 #include <cstring>
 #include <algorithm>
 
+// ICodecAPI не объявлен в этой сборке MinGW-заголовков (codecapi.h содержит только GUID-ы
+// свойств, но не сам интерфейс), поэтому объявляем вручную - бинарный макет COM
+// интерфейса стандартен и задокументирован в Windows SDK (icodecapi.h).
+struct ICodecAPI_Manual : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE IsSupported(const GUID* Api) = 0;
+    virtual HRESULT STDMETHODCALLTYPE IsModifiable(const GUID* Api) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetParameterRange(const GUID* Api, VARIANT* ValueMin, VARIANT* ValueMax, VARIANT* SteppingDelta) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetParameterValues(const GUID* Api, VARIANT** Values, ULONG* ValuesCount) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDefaultValue(const GUID* Api, VARIANT* Value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetValue(const GUID* Api, VARIANT* Value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetValue(const GUID* Api, VARIANT* Value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE RegisterForEvent(const GUID* Api, LONG_PTR userData) = 0;
+    virtual HRESULT STDMETHODCALLTYPE UnregisterForEvent(const GUID* Api) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetAllDefaults(void) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetValueWithNotify(const GUID* Api, VARIANT* Value, GUID** ChangedParam, ULONG* ChangedParamCount) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetAllDefaultsWithNotify(GUID** ChangedParam, ULONG* ChangedParamCount) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetAllSettings(IStream* pStream) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetAllSettings(IStream* pStream) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetAllSettingsWithNotify(IStream* pStream, GUID** ChangedParam, ULONG* ChangedParamCount) = 0;
+};
+static const IID IID_ICodecAPI_Manual =
+    { 0x901db4c7, 0x31ce, 0x41a2, { 0x85, 0xdc, 0x8f, 0xa0, 0xbf, 0x41, 0xb8, 0xda } };
+
 H264Encoder::~H264Encoder() {
     Shutdown();
 }
@@ -29,6 +52,14 @@ bool H264Encoder::Init(int width, int height, int fps, int bitrateBps) {
                           IID_PPV_ARGS(&transform));
     if (FAILED(hr)) return false;
     transform_ = transform;
+
+    // Низкая задержка: отключает внутренний lookahead-буфер энкодера,
+    // который иначе добавляет задержку в несколько кадров независимо от FPS.
+    IMFAttributes* transformAttrs = nullptr;
+    if (SUCCEEDED(transform->GetAttributes(&transformAttrs))) {
+        transformAttrs->SetUINT32(MF_LOW_LATENCY, TRUE);
+        transformAttrs->Release();
+    }
 
     // --- Выходной тип (H.264) ---
     IMFMediaType* outType = nullptr;
@@ -60,8 +91,25 @@ bool H264Encoder::Init(int width, int height, int fps, int bitrateBps) {
     inType->Release();
     if (FAILED(hr)) return false;
 
-    // Примечание: настройка низкой задержки через ICodecAPI пропущена -
-    // в этой сборке MinGW-заголовков нет объявления ICodecAPI. Не критично для работы.
+    // Примечание: раньше тут был пропущен ICodecAPI из-за отсутствия в заголовках,
+    // теперь он объявлен вручную выше - включаем реальное время и низкую задержку явно.
+    ICodecAPI_Manual* codecApi = nullptr;
+    if (SUCCEEDED(transform->QueryInterface(IID_ICodecAPI_Manual, (void**)&codecApi))) {
+        VARIANT v;
+        VariantInit(&v);
+        v.vt = VT_BOOL;
+        v.boolVal = VARIANT_TRUE;
+        codecApi->SetValue(&CODECAPI_AVLowLatencyMode, &v);
+        codecApi->SetValue(&CODECAPI_AVEncCommonRealTime, &v);
+
+        VARIANT vZero;
+        VariantInit(&vZero);
+        vZero.vt = VT_UI4;
+        vZero.ulVal = 0;
+        codecApi->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &vZero); // 0 B-кадров
+
+        codecApi->Release();
+    }
 
     transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
