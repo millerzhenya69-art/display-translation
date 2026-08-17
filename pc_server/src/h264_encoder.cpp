@@ -7,6 +7,7 @@
 #include <codecapi.h>
 #include <cstring>
 #include <algorithm>
+#include <iostream>
 
 // ICodecAPI не объявлен в этой сборке MinGW-заголовков (codecapi.h содержит только GUID-ы
 // свойств, но не сам интерфейс), поэтому объявляем вручную - бинарный макет COM
@@ -47,10 +48,48 @@ bool H264Encoder::Init(int width, int height, int fps, int bitrateBps) {
     HRESULT hr = MFStartup(MF_VERSION);
     if (FAILED(hr)) return false;
 
+    // Сначала пытаемся найти АППАРАТНЫЙ H.264-энкодер (Intel Quick Sync / NVENC / AMD VCE
+    // через их Media Foundation MFT). Программный CLSID_MSH264EncoderMFT грузит CPU и не
+    // умеет стабильно держать высокий FPS - именно он был причиной 30-35 fps вместо 60.
     IMFTransform* transform = nullptr;
-    hr = CoCreateInstance(CLSID_MSH264EncoderMFT, nullptr, CLSCTX_INPROC_SERVER,
-                          IID_PPV_ARGS(&transform));
-    if (FAILED(hr)) return false;
+    bool usedHardware = false;
+
+    MFT_REGISTER_TYPE_INFO inTypeInfo = { MFMediaType_Video, MFVideoFormat_NV12 };
+    MFT_REGISTER_TYPE_INFO outTypeInfo = { MFMediaType_Video, MFVideoFormat_H264 };
+    IMFActivate** activateArray = nullptr;
+    UINT32 activateCount = 0;
+
+    HRESULT hrEnum = MFTEnumEx(
+        MFT_CATEGORY_VIDEO_ENCODER,
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+        &inTypeInfo,
+        &outTypeInfo,
+        &activateArray,
+        &activateCount);
+
+    if (SUCCEEDED(hrEnum) && activateCount > 0) {
+        for (UINT32 i = 0; i < activateCount; ++i) {
+            if (!transform) {
+                IMFTransform* hwTransform = nullptr;
+                if (SUCCEEDED(activateArray[i]->ActivateObject(IID_PPV_ARGS(&hwTransform)))) {
+                    transform = hwTransform;
+                    usedHardware = true;
+                }
+            }
+            activateArray[i]->Release();
+        }
+        CoTaskMemFree(activateArray);
+    }
+
+    if (!transform) {
+        hr = CoCreateInstance(CLSID_MSH264EncoderMFT, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&transform));
+        if (FAILED(hr)) return false;
+    }
+
+    std::cout << "[H264Encoder] Используется " << (usedHardware ? "АППАРАТНЫЙ" : "программный")
+              << " H.264-энкодер" << (usedHardware ? "" : " (аппаратный не найден - возможно, устарели/отсутствуют драйверы GPU)") << "\n";
+
     transform_ = transform;
 
     // Низкая задержка: отключает внутренний lookahead-буфер энкодера,
@@ -107,6 +146,14 @@ bool H264Encoder::Init(int width, int height, int fps, int bitrateBps) {
         vZero.vt = VT_UI4;
         vZero.ulVal = 0;
         codecApi->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &vZero); // 0 B-кадров
+
+        // Периодический keyframe (примерно раз в 2 секунды) - ограничивает визуальные
+        // артефакты при потере/повторном подключении и ускоряет восстановление после сбоя.
+        VARIANT vGop;
+        VariantInit(&vGop);
+        vGop.vt = VT_UI4;
+        vGop.ulVal = static_cast<ULONG>(std::max(1, fps_) * 2);
+        codecApi->SetValue(&CODECAPI_AVEncMPVGOPSize, &vGop);
 
         codecApi->Release();
     }

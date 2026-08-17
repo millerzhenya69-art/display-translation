@@ -7,6 +7,77 @@ import 'package:flutter/services.dart';
 const int kPort = 27183;
 const MethodChannel _videoChannel = MethodChannel('display_translation/video');
 
+// Простая растущая очередь байт без лишних копий. Старый код через
+// BytesBuilder делал toBytes()+clear()+add(sublist) на каждой итерации разбора -
+// это полная перекопировка всего непрочитанного хвоста буфера при каждом вызове, лишня
+// нагрузка на GC и потенциальный источник микрофризов при высоком fps.
+// Каждый байт копируется ровно один раз - когда он окончательно вошёл в собранный кадр.
+class _ByteQueue {
+  final List<Uint8List> _chunks = [];
+  int _headOffset = 0; // сколько байт в начале первого чанка уже съедено
+  int _length = 0;
+
+  int get length => _length;
+
+  void add(Uint8List data) {
+    if (data.isEmpty) return;
+    _chunks.add(data);
+    _length += data.length;
+  }
+
+  // Возвращает ровно [n] байт без удаления из очереди (нужно вызвать consume() отдельно).
+  Uint8List peek(int n) {
+    // Быстрый путь: все нужные байты уже лежат одним куском без копирования.
+    if (_chunks.isNotEmpty) {
+      final first = _chunks.first;
+      if (_headOffset == 0 && first.length == n) return first;
+      if (first.length - _headOffset >= n) {
+        return Uint8List.sublistView(first, _headOffset, _headOffset + n);
+      }
+    }
+    final result = Uint8List(n);
+    int written = 0;
+    int chunkIndex = 0;
+    int inChunkOffset = _headOffset;
+    while (written < n) {
+      final chunk = _chunks[chunkIndex];
+      final available = chunk.length - inChunkOffset;
+      final toCopy = (n - written) < available ? (n - written) : available;
+      result.setRange(written, written + toCopy, chunk, inChunkOffset);
+      written += toCopy;
+      inChunkOffset += toCopy;
+      if (inChunkOffset >= chunk.length) {
+        chunkIndex++;
+        inChunkOffset = 0;
+      }
+    }
+    return result;
+  }
+
+  void consume(int n) {
+    _length -= n;
+    int remaining = n;
+    while (remaining > 0) {
+      final chunk = _chunks.first;
+      final available = chunk.length - _headOffset;
+      if (remaining < available) {
+        _headOffset += remaining;
+        remaining = 0;
+      } else {
+        remaining -= available;
+        _chunks.removeAt(0);
+        _headOffset = 0;
+      }
+    }
+  }
+
+  void clear() {
+    _chunks.clear();
+    _headOffset = 0;
+    _length = 0;
+  }
+}
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
@@ -47,7 +118,7 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
   _ConnState _connState = _ConnState.awaitingSize;
 
   // Буфер для сборки данных из TCP-потока (данные могут прийти по частям).
-  final BytesBuilder _buffer = BytesBuilder(copy: false);
+  final _ByteQueue _buffer = _ByteQueue();
   int? _expectedFrameLen;
 
   @override
@@ -64,6 +135,9 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
     try {
       final socket = await Socket.connect('127.0.0.1', kPort,
           timeout: const Duration(seconds: 5));
+      // Как и на стороне сервера: без этого Nagle's algorithm может задерживать
+      // отправку рукопожатия/мелких пакетов на десятки мс.
+      socket.setOption(SocketOption.tcpNoDelay, true);
       _socket = socket;
       _connState = _ConnState.awaitingSize;
       _buffer.clear();
@@ -122,15 +196,13 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
     _buffer.add(chunk);
 
     if (_connState == _ConnState.awaitingSize) {
-      final bytes = _buffer.toBytes();
-      if (bytes.length < 8) return; // ждём остальные байты рукопожатия
+      if (_buffer.length < 8) return; // ждём остальные байты рукопожатия
 
-      final bd = ByteData.sublistView(bytes, 0, 8);
+      final header = _buffer.peek(8);
+      final bd = ByteData.sublistView(header, 0, 8);
       final frameW = bd.getUint32(0, Endian.little);
       final frameH = bd.getUint32(4, Endian.little);
-
-      _buffer.clear();
-      _buffer.add(bytes.sublist(8));
+      _buffer.consume(8);
       _connState = _ConnState.streaming;
 
       _videoChannel.invokeMethod<int>('start', {
@@ -151,24 +223,19 @@ class _ScreenMirrorPageState extends State<ScreenMirrorPage> {
     if (_connState != _ConnState.streaming) return;
 
     while (true) {
-      final bytes = _buffer.toBytes();
-
       if (_expectedFrameLen == null) {
-        if (bytes.length < 4) break;
-        final bd = ByteData.sublistView(bytes, 0, 4);
+        if (_buffer.length < 4) break;
+        final header = _buffer.peek(4);
+        final bd = ByteData.sublistView(header, 0, 4);
         _expectedFrameLen = bd.getUint32(0, Endian.little);
-        _buffer.clear();
-        _buffer.add(bytes.sublist(4));
+        _buffer.consume(4);
         continue;
       }
 
-      final currentBytes = _buffer.toBytes();
-      if (currentBytes.length < _expectedFrameLen!) break;
+      if (_buffer.length < _expectedFrameLen!) break;
 
-      final frame = currentBytes.sublist(0, _expectedFrameLen!);
-      final rest = currentBytes.sublist(_expectedFrameLen!);
-      _buffer.clear();
-      _buffer.add(rest);
+      final frame = _buffer.peek(_expectedFrameLen!);
+      _buffer.consume(_expectedFrameLen!);
       _expectedFrameLen = null;
 
       // H.264 кадры зависят друг от друга (P-фреймы) - в отличие от JPEG-версии,

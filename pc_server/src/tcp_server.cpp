@@ -33,7 +33,20 @@ bool TcpFrameServer::WaitForClient() {
     sockaddr_in clientAddr = {};
     int addrLen = sizeof(clientAddr);
     clientSock_ = accept(listenSock_, (sockaddr*)&clientAddr, &addrLen);
-    return clientSock_ != INVALID_SOCKET;
+    if (clientSock_ == INVALID_SOCKET) return false;
+
+    // Критично для стабильного FPS: без TCP_NODELAY алгоритм Nagle буферизует мелкие
+    // пакеты (заголовок длины кадра, отдельные NAL-юниты) и может держать их до ~40-200мс
+    // перед отправкой - это даёт скачкообразную задержку независимо от скорости кодирования.
+    int nodelay = 1;
+    setsockopt(clientSock_, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+
+    // Увеличиваем буфер отправки, чтобы SendRaw не блокировался на всплесках размера
+    // I-кадров (они существенно крупнее P-кадров).
+    int sendBuf = 1 << 20; // 1 МБ
+    setsockopt(clientSock_, SOL_SOCKET, SO_SNDBUF, (const char*)&sendBuf, sizeof(sendBuf));
+
+    return true;
 }
 
 bool TcpFrameServer::SendRaw(const uint8_t* data, int len) {

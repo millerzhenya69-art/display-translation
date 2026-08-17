@@ -8,7 +8,7 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 import java.nio.ByteBuffer
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 
 // Нативная сторона видео-декодирования: принимает H.264 NAL-юниты от Dart
@@ -23,7 +23,21 @@ class MainActivity : FlutterActivity() {
     private var codec: MediaCodec? = null
     private var decoderThread: Thread? = null
     @Volatile private var running = false
-    private val inputQueue = LinkedBlockingQueue<ByteArray>()
+
+    // Ограниченная очередь: без лимита (как было с LinkedBlockingQueue) если декодер хоть
+    // немного отстаёт от сети, задержка начинает нарастать лавинообразно и навсегда остаётся
+    // позади. Небольшой кап 8 кадров даёт запас на кратковременные всплески, но не даёт
+    // стабильному отставанию накапливаться: при переполнении самый старый кадр выбрасывается
+    // (сервер теперь шлёт периодический keyframe, поэтому кратковременный артефакт сам исчезнет).
+    private val MAX_QUEUE_SIZE = 8
+    private val inputQueue = ArrayBlockingQueue<ByteArray>(MAX_QUEUE_SIZE)
+
+    private fun offerDroppingOldest(data: ByteArray) {
+        if (!inputQueue.offer(data)) {
+            inputQueue.poll() // выбрасываем самый старый кадр, чтобы освободить место для нового
+            inputQueue.offer(data)
+        }
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -44,7 +58,7 @@ class MainActivity : FlutterActivity() {
                 "feedData" -> {
                     val data = call.argument<ByteArray>("data")
                     if (data != null && running) {
-                        inputQueue.offer(data)
+                        offerDroppingOldest(data)
                     }
                     result.success(null)
                 }

@@ -9,6 +9,9 @@
 
 #include <chrono>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 #include <iostream>
 #include <algorithm>
 
@@ -37,6 +40,21 @@ static void ComputeAutoRegion(int clientW, int clientH, int desktopW, int deskto
     outW = std::max(2, candidateW);
     outH = std::max(2, candidateH);
 }
+
+// Точка передачи кадров из потока захвата в поток кодирования/отправки.
+// Модель "последний кадр побеждает": поток захвата НИКОГДА не блокируется и не ждёт
+// кодирование/отправку - если та сторона тормозит, старые кадры просто перезаписываются
+// более новыми вместо накопления очереди и нарастающей задержки. Это раньше было
+// главным узким местом: захват, конвертация в NV12, кодирование и отправка шли
+// строго последовательно в одном потоке, и любой всплеск времени на одном из этапов
+// (например, программный H.264-энкодер) сразу срывал темп всего конвейера.
+struct FrameHandoff {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::vector<uint8_t> frame;
+    uint64_t version = 0;
+    bool hasFrame = false;
+};
 
 int main() {
     SetConsoleOutputCP(CP_UTF8);
@@ -71,9 +89,6 @@ int main() {
     std::cout << "Затем запустите приложение на планшете.\n\n";
 
     const int frameIntervalMs = 1000 / std::max(1, settings.fps);
-    std::vector<uint8_t> bgraBuffer;
-    std::vector<uint8_t> lastGoodFrame;
-    std::vector<uint8_t> nalBuffer;
 
     while (true) {
         std::cout << "Ожидание подключения планшета...\n";
@@ -124,44 +139,72 @@ int main() {
         }
 
         std::cout << "Начинаю трансляцию.\n";
-        lastGoodFrame.clear();
 
-        // Статистика по этапам для диагностики узких мест по производительности
-        long long sumCaptureMs = 0, sumEncodeMs = 0, sumSendMs = 0;
+        FrameHandoff handoff;
+        std::atomic<bool> streaming{true};
+        std::atomic<bool> fatalCaptureError{false};
+
+        // Поток захвата: крутится независимо от кодирования/отправки. Как только
+        // DXGI отдаёт новый кадр, он сразу публикуется для потока кодирования - тому
+        // больше не нужно ждать AcquireNextFrame внутри общего конвейера.
+        std::thread captureThread([&]() {
+            std::vector<uint8_t> localBuf;
+            while (streaming.load(std::memory_order_relaxed)) {
+                bool hadError = false;
+                bool got = capture.CaptureRegion(regionX, regionY, regionW, regionH,
+                                                  localBuf, frameIntervalMs, hadError);
+                if (hadError) {
+                    std::cerr << "Ошибка захвата экрана, переинициализация...\n";
+                    capture.Shutdown();
+                    if (!capture.Init(settings.monitor_index)) {
+                        std::cerr << "Не удалось восстановить захват экрана\n";
+                        fatalCaptureError.store(true);
+                        streaming.store(false);
+                        handoff.cv.notify_all();
+                        break;
+                    }
+                    continue;
+                }
+                if (got) {
+                    std::lock_guard<std::mutex> lock(handoff.mtx);
+                    handoff.frame.swap(localBuf); // O(1), без копирования пикселей
+                    handoff.version++;
+                    handoff.hasFrame = true;
+                    handoff.cv.notify_one();
+                }
+            }
+        });
+
+        // Кодирование + отправка: работает в собственном темпе (frameIntervalMs) и всегда
+        // берёт САМЫЙ СВЕЖИЙ кадр захвата. Как и раньше, кодируем повторяющиеся кадры,
+        // если экран не менялся - H.264-энкодеру нужен непрерывный поток кадров.
+        std::vector<uint8_t> lastGoodFrame;
+        std::vector<uint8_t> nalBuffer;
+        uint64_t lastSeenVersion = 0;
+
+        long long sumWaitMs = 0, sumEncodeMs = 0, sumSendMs = 0;
         int statFrames = 0;
         auto lastStatsPrint = std::chrono::steady_clock::now();
 
-        while (server.HasClient()) {
+        while (server.HasClient() && streaming.load(std::memory_order_relaxed)) {
             auto frameStart = std::chrono::steady_clock::now();
-            auto tCaptureStart = frameStart;
 
-            bool hadError = false;
-            bool gotFrame = capture.CaptureRegion(
-                regionX, regionY, regionW, regionH,
-                bgraBuffer, frameIntervalMs, hadError);
-
-            auto tCaptureEnd = std::chrono::steady_clock::now();
-
-            if (hadError) {
-                std::cerr << "Ошибка захвата экрана, переинициализация...\n";
-                capture.Shutdown();
-                if (!capture.Init(settings.monitor_index)) {
-                    std::cerr << "Не удалось восстановить захват экрана\n";
-                    server.Stop();
-                    return 1;
+            {
+                std::unique_lock<std::mutex> lock(handoff.mtx);
+                handoff.cv.wait_for(lock, std::chrono::milliseconds(frameIntervalMs), [&]{
+                    return handoff.version != lastSeenVersion || !streaming.load(std::memory_order_relaxed);
+                });
+                if (handoff.hasFrame && handoff.version != lastSeenVersion) {
+                    lastGoodFrame.swap(handoff.frame); // O(1) обмен буферами, без memcpy
+                    lastSeenVersion = handoff.version;
                 }
-                continue;
             }
+            auto tWaitEnd = std::chrono::steady_clock::now();
 
-            if (gotFrame) {
-                lastGoodFrame = bgraBuffer;
-            }
+            if (!streaming.load(std::memory_order_relaxed)) break;
 
-            // H.264-энкодеру нужен непрерывный поток кадров (даже повторяющихся),
-            // иначе он не начнёт выдавать данные - в отличие от JPEG, где кодировали
-            // только реально изменившиеся кадры.
             if (!lastGoodFrame.empty()) {
-                auto tEncodeStart = std::chrono::steady_clock::now();
+                auto tEncodeStart = tWaitEnd;
                 bool encoded = encoder.EncodeFrame(lastGoodFrame.data(), nalBuffer);
                 auto tEncodeEnd = std::chrono::steady_clock::now();
 
@@ -174,18 +217,19 @@ int main() {
                         break;
                     }
 
-                    sumCaptureMs += std::chrono::duration_cast<std::chrono::milliseconds>(tCaptureEnd - tCaptureStart).count();
+                    sumWaitMs += std::chrono::duration_cast<std::chrono::milliseconds>(tWaitEnd - frameStart).count();
                     sumEncodeMs += std::chrono::duration_cast<std::chrono::milliseconds>(tEncodeEnd - tEncodeStart).count();
                     sumSendMs += std::chrono::duration_cast<std::chrono::milliseconds>(tSendEnd - tEncodeEnd).count();
                     statFrames++;
 
                     auto now = std::chrono::steady_clock::now();
                     if (std::chrono::duration_cast<std::chrono::seconds>(now - lastStatsPrint).count() >= 3 && statFrames > 0) {
-                        std::cout << "[диагностика] за " << statFrames << " кадров: захват=" << (sumCaptureMs / statFrames)
+                        long long totalMs = sumWaitMs + sumEncodeMs + sumSendMs;
+                        std::cout << "[диагностика] за " << statFrames << " кадров: ожидание_кадра=" << (sumWaitMs / statFrames)
                                   << "мс, кодирование=" << (sumEncodeMs / statFrames)
                                   << "мс, отправка=" << (sumSendMs / statFrames)
-                                  << "мс, факт. FPS=" << (1000.0 / std::max(1LL, (sumCaptureMs + sumEncodeMs + sumSendMs) / statFrames)) << "\n";
-                        sumCaptureMs = sumEncodeMs = sumSendMs = 0;
+                                  << "мс, факт. FPS=" << (1000.0 * statFrames / std::max(1LL, totalMs)) << "\n";
+                        sumWaitMs = sumEncodeMs = sumSendMs = 0;
                         statFrames = 0;
                         lastStatsPrint = now;
                     }
@@ -201,7 +245,16 @@ int main() {
             }
         }
 
+        streaming.store(false);
+        handoff.cv.notify_all();
+        captureThread.join();
+
         encoder.Shutdown();
+
+        if (fatalCaptureError.load()) {
+            server.Stop();
+            return 1;
+        }
     }
 
     capture.Shutdown();
