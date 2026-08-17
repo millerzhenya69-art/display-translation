@@ -28,9 +28,3 @@ jobs:
       - name: Build release APK
         run: flutter build apk --release
         working-directory: tablet_client
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: display-translation-apk
-          path: tablet_client/build/app/outputs/flutter-apk/app-release.apk
