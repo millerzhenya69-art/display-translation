@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   workflow_dispatch: {}
 
+permissions:
+  contents: write  # нужно, чтобы создавать GitHub Release и прикреплять к нему APK
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -28,3 +31,13 @@ jobs:
       - name: Build release APK
         run: flutter build apk --release
         working-directory: tablet_client
+
+      - name: Publish APK as GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Отдельный тег/релиз на каждый ран - не конфликтует с предыдущими и не упирается в квоту Actions storage,
+          # т.к. ассеты релизов считаются отдельно от Actions artifacts/cache.
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }} (${{ github.sha }})
+          files: tablet_client/build/app/outputs/flutter-apk/app-release.apk
+          make_latest: true
