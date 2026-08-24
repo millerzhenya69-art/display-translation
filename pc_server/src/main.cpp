@@ -14,6 +14,8 @@
 #include <atomic>
 #include <iostream>
 #include <algorithm>
+#include <string>
+#include <windows.h>
 
 // Вычисляет оптимальный регион захвата под разрешение экрана клиента:
 // подбирает максимальный прямоугольник с пропорциями клиента, вписанный
@@ -56,6 +58,29 @@ struct FrameHandoff {
     bool hasFrame = false;
 };
 
+// config.txt всегда лежит РЯДОМ С EXE, а не в текущей рабочей директории процесса.
+// Раньше путь был просто "config.txt" (относительный), и если запустить сервер не из
+// той папки, где лежит exe (например, дважды кликнуть из другого окна консоли, или
+// через ярлык с иной рабочей директорией), файл не находился, тихо создавался новый
+// со значениями по умолчанию - что путало fps и, что хуже, monitor_index (сбрасывался
+// на 0 = основной монитор вместо виртуального).
+static std::string GetConfigPathNextToExe() {
+    wchar_t exePath[MAX_PATH];
+    DWORD len = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return "config.txt"; // на всякий случай - fallback как раньше
+
+    std::wstring wpath(exePath, len);
+    auto pos = wpath.find_last_of(L"\\/");
+    std::wstring dir = (pos == std::wstring::npos) ? L"." : wpath.substr(0, pos);
+    std::wstring wfull = dir + L"\\config.txt";
+
+    int size = WideCharToMultiByte(CP_UTF8, 0, wfull.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return "config.txt";
+    std::string result(static_cast<size_t>(size - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wfull.c_str(), -1, &result[0], size, nullptr, nullptr);
+    return result;
+}
+
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
@@ -64,7 +89,9 @@ int main() {
 
     ListAvailableOutputs();
 
-    Settings settings = Settings::LoadOrCreate("config.txt");
+    const std::string configPath = GetConfigPathNextToExe();
+    std::cout << "Конфиг: " << configPath << "\n";
+    Settings settings = Settings::LoadOrCreate(configPath);
     std::cout << "Регион захвата по умолчанию: " << settings.region_w << "x" << settings.region_h
               << " (будет автоматически подстроен под экран планшета при подключении)\n";
     std::cout << "FPS: " << settings.fps << ", битрейт: " << settings.bitrate_kbps
@@ -185,6 +212,7 @@ int main() {
         long long sumWaitMs = 0, sumEncodeMs = 0, sumSendMs = 0;
         int statFrames = 0;
         auto lastStatsPrint = std::chrono::steady_clock::now();
+        auto windowStart = lastStatsPrint; // для РЕАЛЬНОГО fps - по настенным часам, включая паузу пейсинга
 
         while (server.HasClient() && streaming.load(std::memory_order_relaxed)) {
             auto frameStart = std::chrono::steady_clock::now();
@@ -224,14 +252,19 @@ int main() {
 
                     auto now = std::chrono::steady_clock::now();
                     if (std::chrono::duration_cast<std::chrono::seconds>(now - lastStatsPrint).count() >= 3 && statFrames > 0) {
-                        long long totalMs = sumWaitMs + sumEncodeMs + sumSendMs;
+                        // РЕАЛЬНЫЙ fps считаем по настенным часам за весь период (кадров / секунд),
+                        // а не по сумме wait+encode+send - та сумма НЕ включает паузу пейсинга
+                        // (sleep_for в конце цикла) и поэтому раньше завышала цифру.
+                        double windowSec = std::chrono::duration_cast<std::chrono::duration<double>>(now - windowStart).count();
+                        double realFps = windowSec > 0 ? statFrames / windowSec : 0.0;
                         std::cout << "[диагностика] за " << statFrames << " кадров: ожидание_кадра=" << (sumWaitMs / statFrames)
                                   << "мс, кодирование=" << (sumEncodeMs / statFrames)
                                   << "мс, отправка=" << (sumSendMs / statFrames)
-                                  << "мс, факт. FPS=" << (1000.0 * statFrames / std::max(1LL, totalMs)) << "\n";
+                                  << "мс, реальный FPS=" << realFps << "\n";
                         sumWaitMs = sumEncodeMs = sumSendMs = 0;
                         statFrames = 0;
                         lastStatsPrint = now;
+                        windowStart = now;
                     }
                 }
             }
