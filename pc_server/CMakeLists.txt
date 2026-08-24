@@ -29,6 +29,7 @@ target_link_libraries(dt_server PRIVATE
     mfplat
     mfuuid
     strmiids
+    winmm
 )
 
 # Static-link the mingw runtime so the exe doesn't need libstdc++/libgcc DLLs alongside it

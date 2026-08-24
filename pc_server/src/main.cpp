@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <string>
 #include <windows.h>
+#include <timeapi.h> // timeBeginPeriod/timeEndPeriod - требует линковки winmm
 
 // Вычисляет оптимальный регион захвата под разрешение экрана клиента:
 // подбирает максимальный прямоугольник с пропорциями клиента, вписанный
@@ -85,6 +86,13 @@ int main() {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
+    // По умолчанию Windows будит слеп/таймеры с гранулярностью ≈15.6мс - именно поэтому
+    // ожидание кадра и пауза пейсинга могут просаживать целевые ~16.7мс (60fps)
+    // до ~22-24мс, давая нестабильный fps даже когда кодирование само по себе быстрое. 
+    // timeBeginPeriod(1) затягивает гранулярность до ~1мс на время жизни процесса - стандартный
+    // приём в играх/медиа-приложениях для точного тайминга.
+    timeBeginPeriod(1);
+
     std::cout << "=== Display Translation - PC Server (H.264) ===\n\n";
 
     ListAvailableOutputs();
@@ -101,6 +109,7 @@ int main() {
     ScreenCapture capture;
     if (!capture.Init(settings.monitor_index)) {
         std::cerr << "Не удалось инициализировать захват экрана (DXGI Desktop Duplication)\n";
+        timeEndPeriod(1);
         return 1;
     }
 
@@ -108,6 +117,7 @@ int main() {
     if (!server.Start(settings.port)) {
         std::cerr << "Не удалось запустить TCP-сервер на порту " << settings.port << "\n";
         capture.Shutdown();
+        timeEndPeriod(1);
         return 1;
     }
 
@@ -130,7 +140,7 @@ int main() {
         int regionW = settings.region_w, regionH = settings.region_h;
 
         uint8_t handshake[8];
-        if (server.ReceiveExact(handshake, 8, 3000)) {
+        if (server.ReceiveExact(handshake, 8, 5000)) {
             uint32_t clientW = handshake[0] | (handshake[1] << 8) | (handshake[2] << 16) | (uint32_t(handshake[3]) << 24);
             uint32_t clientH = handshake[4] | (handshake[5] << 8) | (handshake[6] << 16) | (uint32_t(handshake[7]) << 24);
             int monW = 0, monH = 0;
@@ -286,10 +296,12 @@ int main() {
 
         if (fatalCaptureError.load()) {
             server.Stop();
+            timeEndPeriod(1);
             return 1;
         }
     }
 
     capture.Shutdown();
+    timeEndPeriod(1);
     return 0;
 }
